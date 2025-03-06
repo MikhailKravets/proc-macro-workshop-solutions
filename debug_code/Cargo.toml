@@ -1,0 +1,11 @@
+[package]
+name = "debug_code"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+derive_builder = { path = "../builder" }
+seq = { path = "../seq" }
+proc-macro2 = "1.0.93"
+quote = "1.0"
+syn = { version = "2.0.98", features = ["extra-traits"] }
