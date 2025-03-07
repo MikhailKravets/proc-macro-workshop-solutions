@@ -3,22 +3,67 @@ use std::iter::Peekable;
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, ToTokens};
-use syn::visit_mut::VisitMut;
+use syn::{spanned::Spanned, visit_mut::VisitMut};
 
-fn check_ordering<'a>(variants: Peekable<impl Iterator<Item = &'a syn::Ident>>) -> syn::Result<()> {
-    let original: Vec<&syn::Ident> = variants.collect();
-    let mut sorted: Vec<&syn::Ident> = original.clone();
-    sorted.sort();
+enum PatternObject<'a> {
+    Ident(&'a syn::Ident),
+    Path(&'a syn::Path),
+}
 
-    for (orig, s) in original.into_iter().zip(sorted) {
-        if orig != s {
-            return Err(syn::Error::new(
-                s.span(),
-                format!("{} should sort before {}", s, orig),
-            ));
+impl<'a> PatternObject<'a> {
+    fn path_to_string(p: &syn::Path) -> String {
+        let mut s = vec![];
+        for v in p.segments.iter() {
+            s.push(v.ident.to_string());
+        }
+
+        s.join("::")
+    }
+
+    fn to_string(&self) -> String {
+        match self {
+            Self::Ident(i) => i.to_string(),
+            Self::Path(p) => Self::path_to_string(p),
         }
     }
 
+    fn error(&self, msg: &str) -> syn::Error {
+        match self {
+            Self::Ident(i) => syn::Error::new(i.span(), msg),
+            Self::Path(p) => syn::Error::new_spanned(p, msg),
+        }
+    }
+}
+
+fn check_ordering<'a>(variants: Vec<PatternObject>) -> syn::Result<()> {
+    let original: Vec<(String, &PatternObject)> =
+        variants.iter().map(|v| (v.to_string(), v)).collect();
+    let mut sorted = original.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (orig, s) in original.into_iter().zip(sorted) {
+        if orig.0 != s.0 {
+            return Err(s.1.error(&format!("{} should sort before {}", s.0, orig.0)));
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_arm_type<'a>(it: impl Iterator<Item = &'a syn::Arm>) -> syn::Result<()> {
+    for v in it {
+        match v.pat {
+            syn::Pat::TupleStruct(_) => continue,
+            syn::Pat::Path(_) => continue,
+            syn::Pat::Struct(_) => continue,
+            _ => {
+                return Err(syn::Error::new(
+                    v.to_token_stream().span(),
+                    "unsupported by #[sorted]",
+                ))
+            }
+        }
+    }
     Ok(())
 }
 
@@ -63,14 +108,27 @@ impl VisitMut for Matcher {
             .cloned()
             .collect();
 
+        if let Err(e) = verify_arm_type(i.arms.iter()) {
+            self.errors.push(e);
+            return;
+        }
+
         if let Err(e) = check_ordering(
             i.arms
                 .iter()
                 .filter_map(|v| match &v.pat {
-                    syn::Pat::TupleStruct(v) => Some(v.path.get_ident().unwrap()),
-                    _ => None,
+                    syn::Pat::TupleStruct(v) => Some(PatternObject::Path(&v.path)),
+                    syn::Pat::Path(v) => Some(PatternObject::Path(&v.path)),
+                    syn::Pat::Struct(v) => Some(PatternObject::Path(&v.path)),
+                    _ => {
+                        self.errors.push(syn::Error::new(
+                            v.to_token_stream().span(),
+                            "unsupported by #[sorted]",
+                        ));
+                        None
+                    }
                 })
-                .peekable(),
+                .collect(),
         ) {
             self.errors.push(e);
         }
@@ -90,7 +148,14 @@ pub fn sorted(args: TokenStream, input: TokenStream) -> TokenStream {
     };
 
     let mut res = TokenStream2::new();
-    match check_ordering(enum_object.variants.iter().map(|v| &v.ident).peekable()) {
+
+    match check_ordering(
+        enum_object
+            .variants
+            .iter()
+            .map(|v| PatternObject::Ident(&v.ident))
+            .collect(),
+    ) {
         Ok(_) => res.extend(enum_object.to_token_stream()),
         Err(e) => {
             res.extend(e.to_compile_error());
