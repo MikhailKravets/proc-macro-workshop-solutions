@@ -1,4 +1,4 @@
-use std::iter::Peekable;
+use std::cmp;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
@@ -8,6 +8,7 @@ use syn::{spanned::Spanned, visit_mut::VisitMut};
 enum PatternObject<'a> {
     Ident(&'a syn::Ident),
     Path(&'a syn::Path),
+    Wild(&'a syn::PatWild),
 }
 
 impl<'a> PatternObject<'a> {
@@ -24,13 +25,15 @@ impl<'a> PatternObject<'a> {
         match self {
             Self::Ident(i) => i.to_string(),
             Self::Path(p) => Self::path_to_string(p),
+            Self::Wild(_) => String::new(),
         }
     }
 
     fn error(&self, msg: &str) -> syn::Error {
         match self {
-            Self::Ident(i) => syn::Error::new(i.span(), msg),
-            Self::Path(p) => syn::Error::new_spanned(p, msg),
+            Self::Ident(v) => syn::Error::new(v.span(), msg),
+            Self::Path(v) => syn::Error::new_spanned(v, msg),
+            Self::Wild(v) => syn::Error::new(v.span(), msg),
         }
     }
 }
@@ -39,7 +42,11 @@ fn check_ordering<'a>(variants: Vec<PatternObject>) -> syn::Result<()> {
     let original: Vec<(String, &PatternObject)> =
         variants.iter().map(|v| (v.to_string(), v)).collect();
     let mut sorted = original.clone();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted.sort_by(|a, b| match (a.0.is_empty(), b.0.is_empty()) {
+        (true, false) => cmp::Ordering::Greater,
+        (false, true) => cmp::Ordering::Less,
+        _ => a.0.cmp(&b.0),
+    });
 
     for (orig, s) in original.into_iter().zip(sorted) {
         if orig.0 != s.0 {
@@ -56,6 +63,8 @@ fn verify_arm_type<'a>(it: impl Iterator<Item = &'a syn::Arm>) -> syn::Result<()
             syn::Pat::TupleStruct(_) => continue,
             syn::Pat::Path(_) => continue,
             syn::Pat::Struct(_) => continue,
+            syn::Pat::Wild(_) => continue,
+            syn::Pat::Ident(_) => continue,
             _ => {
                 return Err(syn::Error::new(
                     v.to_token_stream().span(),
@@ -117,9 +126,12 @@ impl VisitMut for Matcher {
             i.arms
                 .iter()
                 .filter_map(|v| match &v.pat {
+                    syn::Pat::Ident(v) => Some(PatternObject::Ident(&v.ident)),
                     syn::Pat::TupleStruct(v) => Some(PatternObject::Path(&v.path)),
                     syn::Pat::Path(v) => Some(PatternObject::Path(&v.path)),
                     syn::Pat::Struct(v) => Some(PatternObject::Path(&v.path)),
+                    syn::Pat::Wild(v) => Some(PatternObject::Wild(v)),
+
                     _ => {
                         self.errors.push(syn::Error::new(
                             v.to_token_stream().span(),
@@ -179,7 +191,7 @@ pub fn check(args: TokenStream, input: TokenStream) -> TokenStream {
     };
     let mut matcher = Matcher::new();
     matcher.visit_item_fn_mut(&mut fun);
-    println!("{:#?}", matcher.errors);
+    // println!("{:#?}", matcher.errors);
     let mut res = matcher.errors_to_token_stream();
     res.extend(fun.to_token_stream());
 
